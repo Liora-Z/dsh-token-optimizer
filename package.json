@@ -9,7 +9,6 @@
     ".": "./src/index.js"
   },
   "files": [
-  "files": [
     "src",
     "scripts",
     "cordis.patch.yml",
