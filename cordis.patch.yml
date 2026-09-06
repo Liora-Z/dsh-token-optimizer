@@ -1,0 +1,57 @@
+# dsh bundle layer: mount the token-optimizer plugin.
+# The plugin package root export (src/index.js) is a Cordis plugin; the
+# loader resolves the row by package name after the dsh-base layer inserts.
+- insert:
+    - id: token-optimizer
+      name: 'dsh-token-optimizer'
+      config:
+        toolTrim:
+          enabled: true
+          allow:
+            # 文件操作
+            - read            # 读 UTF-8 文本文件(带行号,支持 offset/limit)
+            - glob            # 文件名模式搜索
+            - grep            # 文件内容正则搜索
+            - write           # 写文件
+            - edit            # 字面替换编辑
+            - read_image      # 读图片(视觉模型)
+            # 命令执行(本部署无 bash,shell 工具是 pwsh)
+            - pwsh            # 执行 PowerShell 命令
+            # 联网
+            - web_search      # 联网搜索(摘要 + 来源 URL)
+            # 协作
+            - todo_write      # 任务清单(计划跟踪)
+            - ask_user_question  # 向用户提问
+            - skill           # 加载技能完整指令
+            - subagent        # 后台派生子代理(并行干活)
+            - interrupt_agent # 打断正在运行的子代理
+            - exit_plan_mode  # 计划模式退出(dsh-plan-mode)
+            # GitHub(dsh-github 系列插件)
+            - github_search
+            - github_issue_read
+            - github_issue_create
+            - github_issue_comment
+            - github_pr_read
+            - github_pr_create
+            # modlens
+            - modlens_read_image  # modlens 读图(多模型视觉)
+            # dsh-memory-evolve
+            - memory          # 项目记忆
+            - de_channel_send # 记忆广播频道
+            - dtodo           # 记忆 todo
+            # dsh-undo-savepoint(撤销快照体系,15 个)
+            - undo_compact
+            - undo_diff
+            - undo_doctor
+            - undo_export
+            - undo_import
+            - undo_list
+            - undo_message
+            - undo_message_list
+            - undo_note
+            - undo_prune
+            - undo_recent
+            - undo_restore
+            - undo_safe_mode
+            - undo_scan
+            - undo_snapshot
