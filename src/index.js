@@ -13,8 +13,7 @@
 //     tool-result-pruner(8192 字符,仅压缩触发)、spill(>50k 字节落盘可检索)
 //
 // v2 模块清单:
-//   1. text2img  长文本→图片→vision 摘要(超长自然语言文本,实测省 ~72%)
-//   2. outputLadder  工具输出出生点单次遍历分流(合并 v1 的 compress/sample/pruning
+//   1. text2img  长文本→图片→vision 摘要(超长自然语言文本;单次样本曾省 ~72%,真正的价值是"会话越长越省")
 //      截断意图):错误摘要 / JSON-CSV 结构压缩 / shell 采样,原文落盘可逆
 //   3. cache     结果缓存(相同工具调用 TTL 内短路复用)
 //   4. monitor   会话结束统计报告(v2 新增真实 usage 聚合与缓存命中率)

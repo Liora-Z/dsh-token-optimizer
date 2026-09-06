@@ -10,14 +10,12 @@
 
 | 模块 | 钩子 | 作用 |
 | :--- | :--- | :--- |
-| text2img | `agent/pre-step` | 超长自然语言文本（>5000 字符）→ 渲染成图 → vision 读图 → 摘要替换进上下文。**实测省 ~72%**。JSON/代码自动跳过 |
+| text2img | `agent/pre-step` | 超长自然语言文本（>5000 字符）→ 渲染成图 → vision 读图 → 摘要替换进上下文。单次样本曾省 ~72%；真正价值是**长会话越省**（后续轮次不再携带原文）。JSON/代码自动跳过 |
 | outputLadder | `tools/post-execute` | 工具输出出生点**单次遍历分流**：错误结果→300 字符摘要；JSON 数组/CSV（≥10k 字符）→结构感知压缩；shell 输出（≥8k 字符）→头尾+等距采样；≥50k 字节交核心 spill；read 类豁免。原文落盘可逆 |
-| cache | `tools/execute` | 相同工具调用（名称+参数指纹）TTL 内短路复用；仅缓存只读白名单工具（默认 glob/grep） |
 | fileDiff | `tools/post-execute` | 重复读文件：未变→折叠标记；有变→只发变更区段 diff |
 | toolTrim | `agent/created` | 工具可见性管理：静态裁剪 + **MCP 懒加载**——不用的 `mcp__*` 工具 schema **不进请求**（实测省 ~9.4k token/请求） |
 | compactionDriver | `agent/status` | agent idle 时按自定义压力比（默认 45%）驱动核心 `compactNow`，让长会话压缩真正发生（核心 0.8 阈值对 1M 窗口几乎永不触发） |
-| monitor | `session/disposed` | 会话结束输出节省统计 + **真实 usage 聚合与缓存命中率**（实测长会话 99.75%） |
-
+| monitor | `session/disposed` | 会话结束输出节省统计 + **真实 usage 聚合与缓存命中率**(长会话常态 97%–99.3%) |
 ## 与 DSH 核心的边界
 
 DSH 已内置 `token-meter`、`compaction-basic`、`tool-result-pruner`、`spill`、`llm-retry`、`repeat-tool-reminder`——
