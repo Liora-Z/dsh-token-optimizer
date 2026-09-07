@@ -141,8 +141,8 @@ node test/text2img-e2e.mjs   # 真实端到端（需 API key + Windows 渲染）
 
 - 自然语言配置工具（让模型改配置）
 - 长文本→图片的跨平台渲染 fallback
-- 与 [dsh-behavior-enhancer](https://github.com/Liora-Z/dsh-behavior-enhancer) 协同（内容压缩 × 行为管理，可独立安装）
+- 与 [dsh-behavior-enhancer](https://github.com/Zoria-Lind/dsh-behavior-enhancer) 协同（内容压缩 × 行为管理，可独立安装）
 
 ## 许可 / License
 
-[MIT](LICENSE) © 2026 Liora
+[MIT](LICENSE) © 2026 Zoria Lind
