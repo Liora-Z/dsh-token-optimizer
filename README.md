@@ -112,6 +112,23 @@ web 部署因此**没有 compaction 服务**，`compactionDriver` 会静默不�
 - **text2img 摘要**：需 `DEEPSEEK_API_KEY` 环境变量（DSH 已配置）。
 - **mcpLazy**：需 profile 挂载 `@deepseek-ai/dsh-mcp-client` 并配置至少一个 MCP 服务器；无 MCP 时自动 no-op。
 
+## 权限与边界（上架声明）
+
+本插件是**高权限**插件：为实现压缩/转图/调度功能，运行时需要访问文件、网络、命令与凭据。以下为完整边界声明（与 DSH Store 审查口径一致）：
+
+| 类别 | 实际行为 | 边界 |
+| :--- | :--- | :--- |
+| 文件 files | 写 `~/.dsh/token-optimizer/` 下的落盘原文（text2img-originals / originals / filediff-originals）、系统临时目录的渲染 PNG；设 `DSH_TOKEN_OPTIMIZER_DEBUG=1` 时写调试日志 | 只写插件自有状态目录与临时产物，**不写 Profile 配置、不改 DSH 核心/官方包**；日志默认关闭 |
+| 网络 network | text2img 摘要调用 `baseUrl`（默认 `https://api.deepseek.com/v1`）的 `/chat/completions` | 只向该端点发送需摘要的文本与渲染图；请求失败即降级跳过转图，不阻断会话 |
+| 命令 commands | Windows 上用 PowerShell + .NET System.Drawing 渲染文本图片（`scripts/render-text.ps1`） | 只执行插件自带渲染脚本，参数固定；非 Windows 自动降级为仅落盘，不执行任何命令 |
+| 凭据 credentials | 经 DSH 凭据服务 `ctx.credentials.resolve` 读取；不可用时回退 `process.env.DEEPSEEK_API_KEY` | 仅用于 text2img 的 vision 调用，写入请求头后不落盘、不写日志、不外传 |
+
+- **运行时依赖**：零 npm 依赖。text2img 摘要依赖外部服务 DeepSeek API（key 由 DSH 凭据/环境变量提供）；Windows 渲染依赖 PowerShell + .NET System.Drawing（系统自带）。
+- **失败边界**：所有模块 fail-open——任一步出错只降级跳过（保留原文），不影响 DSH 核心流程；模块间无共享可变状态，卸载时统一清理钩子。
+- **已知风险**：text2img 摘要可能不准确（摘要自带警告标记，原文落盘可查）；outputLadder/fileDiff 压缩丢细节（原文落盘可回放）；compactionDriver 触发压缩后旧历史按 DSH 核心语义进入可回放区；toolTrim 的 `allow` 为排他白名单，误配会让工具对模型不可见（默认关闭）。
+- **兼容范围**：完整开发与验证基于 DSH `0.1.1-rc.2`（Node ≥ 18）；`0.1.2+` 与 `0.1.3+` 尚未验证，在 `package.json` 的 `dsh.compatibility.dshReleases` 中标为 `unknown`。
+
+
 ## 开发
 
 ```bash
@@ -125,3 +142,7 @@ node test/text2img-e2e.mjs   # 真实端到端（需 API key + Windows 渲染）
 - 自然语言配置工具（让模型改配置）
 - 长文本→图片的跨平台渲染 fallback
 - 与 [dsh-behavior-enhancer](https://github.com/Liora-Z/dsh-behavior-enhancer) 协同（内容压缩 × 行为管理，可独立安装）
+
+## 许可 / License
+
+[MIT](LICENSE) © 2026 Liora
