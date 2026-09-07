@@ -1,9 +1,9 @@
 我盼了很久的 DeepSeek Harness，最终还是自己补上了烧钱的窟窿
 
-仓库：Liora2050348900/dsh-token-optimizer（MIT License）
+仓库：Liora-Z/dsh-token-optimizer（MIT License）
 
 我是DeepSeek的忠实粉丝。我早先是把DeepSeek接进Claude Code里用的，但一直盼着自家的Harness，盼星星盼月亮，真出来那天，就迫不及待安装用了下——能用，可差强人意：同样的任务，做得没Claude Code好，token却花得只多不少。正好那阵子我一位朋友有天天在我耳边叨叨opencode这种"省 token"的架构，我心里就更不舒服了。
-但我懒得跟他吵，而是琢磨起"Everything is a Plugin"的路子。我决定自己写个插件，把DSH太费token这个钱窟窿补上，此插件，就叫dsh-token-optimizer（社区里有不少和我同名的插件，请认准Liora2050348900/dsh-token-optimizer嗷）。
+但我懒得跟他吵，而是琢磨起"Everything is a Plugin"的路子。我决定自己写个插件，把DSH太费token这个钱窟窿补上，此插件，就叫dsh-token-optimizer（社区里有不少和我同名的插件，请认准Liora-Z/dsh-token-optimizer嗷）。
 
 我的构想有原创也有借鉴。
 
@@ -44,4 +44,4 @@ fileDiff还算感受直观，它记文件哈希，第二次读即知变没变。
 monitor功能很简单，它负责算真实的缓存命中率（缓存命中 / (输入+缓存命中)），长会话常态 97–99.3%。
 
 简言之，这插件办的事就一件：给大家省token。
-我是真心喜爱DeepSeek，才为此费心费力。插件代码都开源了（Poweshell里dsh plugin --profile web add ./dsh-token-optimizer就能安装了，详细指引请看https://github.com/Liora2050348900/dsh-token-optimizer），你要是也觉得有点意思，拿去用；要是官方看到了，请多考虑考虑，在线求功能收编。
+我是真心喜爱DeepSeek，才为此费心费力。插件代码都开源了（Poweshell里dsh plugin --profile web add ./dsh-token-optimizer就能安装了，详细指引请看https://github.com/Liora-Z/dsh-token-optimizer），你要是也觉得有点意思，拿去用；要是官方看到了，请多考虑考虑，在线求功能收编。
