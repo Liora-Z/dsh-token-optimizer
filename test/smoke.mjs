@@ -1,9 +1,12 @@
 // 单进程 smoke 验证(替代 node --test,规避沙箱 spawn EPERM)。
 // 用法: node test/smoke.mjs
 
+import { mkdtempSync, readdirSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { resolveConfig } from '../src/config.js'
 import { createStats } from '../src/stats.js'
-import { createText2imgModule } from '../src/modules/text2img.js'
+import { createText2imgModule, splitChunks } from '../src/modules/text2img.js'
 import { createCacheModule } from '../src/modules/cache.js'
 import { createMonitorModule } from '../src/modules/monitor.js'
 import { createFileDiffModule } from '../src/modules/fileDiff.js'
@@ -50,19 +53,34 @@ console.log('== config ==')
   check('默认 structureThreshold 10000', cfg.outputLadder.structureThreshold === 10000)
   check('默认 ttl 3600', cfg.cache.ttl === 3600)
   check('默认 pressureRatio 0.45', cfg.compactionDriver.pressureRatio === 0.45)
+  // v2.1 新默认值
+  check('v2.1 默认 text2img.threshold 1000', cfg.text2img.threshold === 1000)
+  check('v2.1 默认 askTimeoutMs 120000', cfg.text2img.askTimeoutMs === 120000)
+  check('v2.1 默认 dynamicResolution true', cfg.text2img.dynamicResolution === true)
+  check('v2.1 默认 summaryCache true', cfg.text2img.summaryCache === true)
+  check('v2.1 默认分档 3 档', cfg.text2img.resolutionTiers.length === 3 && cfg.text2img.resolutionTiers[2].maxChars === Infinity)
+  check('v2.1 pagesPerBatch 默认 4', cfg.text2img.pagesPerBatch === 4)
+  check('memory_bridge 占位节 enabled=false', cfg.memory_bridge.enabled === false)
+  check('memory_bridge sync_dir 默认', cfg.memory_bridge.sync_dir === '~/.dsh-memory')
   let threw = false
   try { resolveConfig({ outputLadder: { bogus: 1 } }) } catch { threw = true }
   check('未知键报错', threw)
   threw = false
   try { resolveConfig({ outputLadder: { structureThreshold: -5 } }) } catch { threw = true }
   check('负数报错', threw)
+  threw = false
+  try { resolveConfig({ text2img: { resolutionTiers: [{ maxChars: 500, width: 640, height: 360, fontSize: 24 }, { maxChars: 300, width: 1280, height: 720, fontSize: 24 }] } }) } catch { threw = true }
+  check('分档 maxChars 未递增报错', threw)
+  threw = false
+  try { resolveConfig({ text2img: { resolutionTiers: [{ maxChars: 2000, width: 9000, height: 360, fontSize: 24 }] } }) } catch { threw = true }
+  check('分档超视觉 API 长边限制报错', threw)
   // v1 退役节静默忽略不抛
   let legacyThrew = false
   try { resolveConfig({ compress: { threshold: 1 }, pruning: {}, dedup: {}, sample: {} }) } catch { legacyThrew = true }
   check('退役节静默忽略不抛', !legacyThrew)
 }
 
-console.log('== text2img 完整流程(mock 渲染+摘要) ==')
+console.log('== text2img 完整流程(askOnSkip=false 自动路径,mock 渲染+摘要) ==')
 {
   const ctx = makeFakeCtx()
   const stats = createStats()
@@ -71,13 +89,14 @@ console.log('== text2img 完整流程(mock 渲染+摘要) ==')
     renderToPng: async (text) => '/tmp/fake.png',
     summarizeImage: async (png, cfg) => `[摘要] 共 ${Math.floor(png.length)} 字节图片,内容摘要:这是一段测试文本的简要概括。`,
   }
-  createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false }, stats, deps)
+  createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, askOnSkip: false, summaryCache: false }, stats, deps)
   const longText = '这是' + '一段很长很长很长很长很长很长很长很长的自然语言文本内容,用于测试摘要替换。'.repeat(10)
   const nextLong = async () => ({ kind: 'enter', messages: [{ role: 'user', content: longText }] })
   const dLong = await ctx.emit('agent/pre-step', { signal: {} }, nextLong)
   check('长自然语言文本触发 text2img', /text2img/.test(txt(dLong.messages[0].content)))
   check('text2img 内容包含摘要', /\[摘要\]/.test(txt(dLong.messages[0].content)))
   check('text2img 替换后更短', txt(dLong.messages[0].content).length < longText.length)
+  check('text2img 摘要标注含核对堵漏', /先 read 原文文件核对/.test(txt(dLong.messages[0].content)))
   check('text2img.messages=1', stats.snapshot().counters['text2img.messages'] === 1)
   check('text2img.savedChars>0', stats.snapshot().counters['text2img.savedChars'] > 0)
   // JSON 不触发(内容类型判断)
@@ -97,11 +116,37 @@ console.log('== text2img 完整流程(mock 渲染+摘要) ==')
     renderToPng: async () => { throw new Error('render boom') },
     summarizeImage: async () => 'x',
   }
-  createText2imgModule(ctx2, { ...resolveConfig({}).text2img, threshold: 100 }, stats2, depsFail)
+  createText2imgModule(ctx2, { ...resolveConfig({}).text2img, threshold: 100, askOnSkip: false, summaryCache: false }, stats2, depsFail)
   const nextFail = async () => ({ kind: 'enter', messages: [{ role: 'user', content: longText }] })
   const dFail = await ctx2.emit('agent/pre-step', { signal: {} }, nextFail)
   check('渲染失败保留原文', dFail.messages[0].content === longText)
   check('text2img.failures=1', stats2.snapshot().counters['text2img.failures'] === 1)
+}
+
+console.log('== text2img v2.1 摘要上限随输入缩放 ==')
+{
+  const ctx = makeFakeCtx()
+  let capSeen = 0
+  const deps = {
+    renderToPng: async () => '/tmp/fake.png',
+    // 模拟真实 summarizeImage:按传入的 maxSummaryChars 截断
+    summarizeImage: async (png, cfg) => { capSeen = cfg.maxSummaryChars; return '长'.repeat(1500).slice(0, cfg.maxSummaryChars) },
+  }
+  createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, askOnSkip: false, summaryCache: false }, createStats(), deps)
+  const text800 = '这是一段' + '用于验证摘要上限缩放的自然语言长文本。'.repeat(20) // ~600-800 字
+  const d = await ctx.emit('agent/pre-step', { signal: {} }, async () => ({ kind: 'enter', messages: [{ content: text800 }] }))
+  const expectedCap = Math.min(2000, Math.max(200, Math.round(text800.length * 0.4)))
+  check('v2.1 摘要上限按输入缩放(0.4 比)', capSeen === expectedCap && capSeen < 2000)
+  check('v2.1 缩放后替换一定更短', txt(d.messages[0].content).length < text800.length)
+  check('v2.1 缩放摘要不超上限', /text2img/.test(txt(d.messages[0].content)))
+}
+
+console.log('== text2img 分批摘要分块 ==')
+{
+  const c9 = splitChunks(Array.from({ length: 9 }, (_, i) => `p${i}`), 4)
+  check('splitChunks 9 页/批 4 → [4,4,1]', c9.length === 3 && c9[0].length === 4 && c9[1].length === 4 && c9[2].length === 1)
+  const c5 = splitChunks([1, 2, 3, 4, 5], 4)
+  check('splitChunks 5 页/批 4 → [4,1]', c5.length === 2 && c5[1].length === 1)
 }
 
 // 多页渲染:renderer 返回路径数组,应全部送入摘要
@@ -112,7 +157,7 @@ console.log('== text2img 完整流程(mock 渲染+摘要) ==')
     renderToPng: async () => ['/tmp/fake-p1.png', '/tmp/fake-p2.png'],
     summarizeImage: async (pngs) => `[摘要] 共 ${pngs.length} 页图片`,
   }
-  createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false }, stats, deps)
+  createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, askOnSkip: false, summaryCache: false }, stats, deps)
   const multiText = '多页测试' + '这是一段用于多页渲染测试的长文本内容。'.repeat(20)
   const nextMulti = async () => ({ kind: 'enter', messages: [{ role: 'user', content: multiText }] })
   const dMulti = await ctx.emit('agent/pre-step', { signal: {} }, nextMulti)
@@ -121,7 +166,7 @@ console.log('== text2img 完整流程(mock 渲染+摘要) ==')
   check('多页统计计数', stats.snapshot().counters['text2img.messages'] === 1)
 }
 
-console.log('== text2img 结构过滤(v2 精化) ==')
+console.log('== text2img 结构过滤(askOnSkip=false 自动路径) ==')
 {
   const ctx = makeFakeCtx()
   const stats = createStats()
@@ -129,7 +174,7 @@ console.log('== text2img 结构过滤(v2 精化) ==')
     renderToPng: async () => '/tmp/fake.png',
     summarizeImage: async () => '[摘要] 测试摘要。',
   }
-  createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false }, stats, deps)
+  createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, askOnSkip: false, summaryCache: false }, stats, deps)
   // 1) ≥5 条纯分隔线 + >200 行 → 拒绝(跳过计数+不替换)
   const sepLines = ['----------------', '================', '+----+----+', '----------------', '**********', ...Array.from({ length: 250 }, (_, i) => `这是第 ${i} 行正文内容,用于测试结构强度过滤。`)].join('\n')
   const dSep = await ctx.emit('agent/pre-step', { signal: {} }, async () => ({ kind: 'enter', messages: [{ content: sepLines }] }))
@@ -141,7 +186,7 @@ console.log('== text2img 结构过滤(v2 精化) ==')
   check('text2img 单分隔线长文触发', /text2img/.test(txt(dOne.messages[0].content)))
 }
 
-console.log('== text2img 强制转图询问(askOnSkip) ==')
+console.log('== text2img v2.1 达阈值询问(askOnSkip=true 主路径) ==')
 {
   const mkCtxWithAsk = (askImpl) => {
     const ctx = makeFakeCtx()
@@ -154,65 +199,266 @@ console.log('== text2img 强制转图询问(askOnSkip) ==')
   }
   const mkDeps = () => ({
     renderToPng: async () => '/tmp/fake.png',
-    summarizeImage: async () => '[摘要] 强制转图后的摘要内容。',
+    summarizeImage: async () => '[摘要] 询问流程测试摘要。',
   })
+  const nlText = '这是一段' + '用于询问机制测试的自然语言长文本内容。'.repeat(15)
   const structural = ['----------------', '================', '+----+----+', '----------------', '**********', ...Array.from({ length: 250 }, (_, i) => `这是第 ${i} 行正文内容,用于测试结构强度过滤。`)].join('\n')
   const enterWith = (text) => async () => ({ kind: 'enter', messages: [{ content: text }] })
   const markRunning = (ctx) => ctx.emit('agent/status', { agent: { id: 'root1' }, status: 'running' })
+  const base = { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, summaryCache: false }
 
-  // 1) 用户选"强制转图" → 走渲染;ask 请求必须带 agent(web provider 强制)
+  // 1) 自然语言达阈值 → 询问;推荐项(转图)在第一位;ask 请求必须带 agent(web provider 强制)
   {
     let askCount = 0
     let askGotAgent = false
-    const ctx = mkCtxWithAsk(async (req) => { askCount += 1; askGotAgent = !!req?.agent; return { answers: [{ id: 'force_text2img', selected: ['yes'] }] } })
+    let firstLabel = ''
+    let questionText = ''
+    const ctx = mkCtxWithAsk(async (req) => {
+      askCount += 1
+      askGotAgent = !!req?.agent
+      firstLabel = req.questions[0].options[0].label
+      questionText = req.questions[0].question
+      return { answers: [{ id: 'text2img_path', selected: ['转图摘要(推荐)'] }] }
+    })
     const stats = createStats()
-    createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, askOnSkip: true }, stats, mkDeps())
+    createText2imgModule(ctx, { ...base, askOnSkip: true }, stats, mkDeps())
     await markRunning(ctx)
-    const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(structural))
-    check('askOnSkip 选是→强制转图', /text2img/.test(txt(d.messages[0].content)))
-    check('text2img.forced 计数', stats.snapshot().counters['text2img.forced'] === 1)
-    check('ask 被调用一次且带 agent', askCount === 1 && askGotAgent)
+    const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    check('v2.1 自然语言达阈值先询问', askCount === 1 && askGotAgent)
+    check('v2.1 自然语言推荐项转图在首位', /转图摘要/.test(firstLabel))
+    check('v2.1 弹窗含经济账估算', /token/.test(questionText) && /页图片/.test(questionText) && /摘要 ≤/.test(questionText))
+    check('v2.1 选转图 → 摘要替换', /text2img/.test(txt(d.messages[0].content)))
+    check('v2.1 asked 计数', stats.snapshot().counters['text2img.asked'] === 1)
   }
-  // 2) 用户选"不转图" → 原文保留
+  // 2) 自然语言选"直接阅读原文" → 原文保留
   {
     let askCount = 0
-    const ctx = mkCtxWithAsk(async () => { askCount += 1; return { answers: [{ id: 'force_text2img', selected: ['no'] }] } })
+    const ctx = mkCtxWithAsk(async () => { askCount += 1; return { answers: [{ id: 'text2img_path', selected: ['直接阅读原文'] }] } })
     const stats = createStats()
-    createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, askOnSkip: true }, stats, mkDeps())
+    createText2imgModule(ctx, { ...base, askOnSkip: true }, stats, mkDeps())
+    await markRunning(ctx)
+    const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    check('v2.1 选读原文 → 原文保留', d.messages[0].content === nlText)
+    check('v2.1 读原文 skipped 计数', stats.snapshot().counters['text2img.skipped'] === 1)
+  }
+  // 3) 结构性强 → 推荐项(读原文)在第一位;选转图 → forced 计数
+  {
+    let firstLabel = ''
+    const ctx = mkCtxWithAsk(async (req) => {
+      firstLabel = req.questions[0].options[0].label
+      return { answers: [{ id: 'text2img_path', selected: ['转图摘要'] }] }
+    })
+    const stats = createStats()
+    createText2imgModule(ctx, { ...base, askOnSkip: true }, stats, mkDeps())
     await markRunning(ctx)
     const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(structural))
-    check('askOnSkip 选否→原文保留', d.messages[0].content === structural)
-    check('text2img.skipped 计数', stats.snapshot().counters['text2img.skipped'] === 1)
-    // 3) 同一文本再次出现 → 指纹去重,不再问
-    await ctx.emit('agent/pre-step', { signal: {} }, enterWith(structural))
-    check('同一文本不重复询问', askCount === 1)
+    check('v2.1 结构性强推荐项读原文在首位', /直接阅读原文/.test(firstLabel))
+    check('v2.1 结构性强选转图 → 转换', /text2img/.test(txt(d.messages[0].content)))
+    check('v2.1 forced 计数', stats.snapshot().counters['text2img.forced'] === 1)
   }
-  // 4) ask 抛错(NO_PROVIDER 等)→ 降级不转图不崩
+  // 4) 询问超时 → 按内容类型默认(自然语言转图 / 结构性强读原文)
+  {
+    const mkTimeoutAsk = () => async (req) => new Promise((_, reject) => {
+      req.signal.addEventListener('abort', () => reject(new Error('ASK_ABORTED')))
+    })
+    {
+      const ctx = mkCtxWithAsk(mkTimeoutAsk())
+      createText2imgModule(ctx, { ...base, askOnSkip: true, askTimeoutMs: 60 }, createStats(), mkDeps())
+      await markRunning(ctx)
+      const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+      check('v2.1 超时默认:自然语言→转图', /text2img/.test(txt(d.messages[0].content)))
+    }
+    {
+      const ctx = mkCtxWithAsk(mkTimeoutAsk())
+      createText2imgModule(ctx, { ...base, askOnSkip: true, askTimeoutMs: 60 }, createStats(), mkDeps())
+      await markRunning(ctx)
+      const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(structural))
+      check('v2.1 超时默认:结构性强→读原文', d.messages[0].content === structural)
+    }
+  }
+  // 5) ask 抛错(NO_PROVIDER 等)→ 自然语言也降级为读原文(fail-safe,不再自动转图)
   {
     const ctx = mkCtxWithAsk(async () => { throw new Error('NO_PROVIDER') })
     const stats = createStats()
-    createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, askOnSkip: true }, stats, mkDeps())
+    createText2imgModule(ctx, { ...base, askOnSkip: true }, stats, mkDeps())
     await markRunning(ctx)
-    const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(structural))
-    check('ask 抛错降级为不转图', d.messages[0].content === structural)
+    const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    check('v2.1 ask 抛错自然语言降级读原文', d.messages[0].content === nlText)
   }
-  // 4b) 没有 running 事件(拿不到当前 agent)→ 不询问直接跳过
+  // 6) 没有 running 事件(拿不到当前 agent)→ 不询问直接读原文
   {
     let askCount = 0
     const ctx = mkCtxWithAsk(async () => { askCount += 1; return { answers: [] } })
-    createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, askOnSkip: true }, createStats(), mkDeps())
-    const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(structural))
-    check('无当前 agent 不询问直接跳过', d.messages[0].content === structural && askCount === 0)
+    createText2imgModule(ctx, { ...base, askOnSkip: true }, createStats(), mkDeps())
+    const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    check('v2.1 无当前 agent 不询问直接读原文', d.messages[0].content === nlText && askCount === 0)
   }
-  // 5) askOnSkip=false → 不询问直接跳过
+  // 7) 无 userQuestions 服务(fake ctx 无 inject)→ 读原文,不崩
+  {
+    const ctx = makeFakeCtx()
+    createText2imgModule(ctx, { ...base, askOnSkip: true }, createStats(), mkDeps())
+    const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    check('v2.1 无 provider 读原文不崩', d.messages[0].content === nlText)
+  }
+  // 8) askOnSkip=false → 不询问,自然语言自动转图(v2.0 行为)
   {
     let askCount = 0
     const ctx = mkCtxWithAsk(async () => { askCount += 1; return { answers: [] } })
-    createText2imgModule(ctx, { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, askOnSkip: false }, createStats(), mkDeps())
+    createText2imgModule(ctx, { ...base, askOnSkip: false }, createStats(), mkDeps())
     await markRunning(ctx)
-    await ctx.emit('agent/pre-step', { signal: {} }, enterWith(structural))
-    check('askOnSkip=false 不询问', askCount === 0)
+    const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    check('v2.1 askOnSkip=false 自动转图不询问', /text2img/.test(txt(d.messages[0].content)) && askCount === 0)
   }
+  // 9) 同一文本再次出现 → 指纹去重复用上次选择,不再问
+  {
+    let askCount = 0
+    const ctx = mkCtxWithAsk(async () => { askCount += 1; return { answers: [{ id: 'text2img_path', selected: ['转图摘要(推荐)'] }] } })
+    createText2imgModule(ctx, { ...base, askOnSkip: true }, createStats(), mkDeps())
+    await markRunning(ctx)
+    const d1 = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    const d2 = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    check('v2.1 同一文本不重复询问', askCount === 1)
+    check('v2.1 重复文本复用上次选择(转图)', /text2img/.test(txt(d2.messages[0].content)) && /text2img/.test(txt(d1.messages[0].content)))
+  }
+  // 10) maxAsksPerSession 弹窗配额:首次询问,后续不同文本按内容类型默认静默执行
+  {
+    let askCount = 0
+    const ctx = mkCtxWithAsk(async () => { askCount += 1; return { answers: [{ id: 'text2img_path', selected: ['直接阅读原文'] }] } })
+    createText2imgModule(ctx, { ...base, askOnSkip: true, maxAsksPerSession: 1 }, createStats(), mkDeps())
+    await markRunning(ctx)
+    const d1 = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    const other = '另一段' + '完全不同的自然语言文本内容用于弹窗配额测试。'.repeat(15)
+    const d2 = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(other))
+    check('v2.1 弹窗配额:首次询问,后续静默默认(自然语言→转图)', askCount === 1 && d1.messages[0].content === nlText && /text2img/.test(txt(d2.messages[0].content)))
+  }
+  // 11) 运行时上下文快照(source.kind='plugin')不参与处理(乱触发事故回归:
+  //     短指令 + 2864 字符 runtime-context 快照 → 弹窗指向快照)
+  {
+    let askCount = 0
+    const ctx = mkCtxWithAsk(async () => { askCount += 1; return { answers: [{ id: 'text2img_path', selected: ['转图摘要(推荐)'] }] } })
+    createText2imgModule(ctx, { ...base, askOnSkip: true }, createStats(), mkDeps())
+    await markRunning(ctx)
+    const runtime = {
+      role: 'user',
+      source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt', form: 'snapshot' },
+      content: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.'.repeat(60),
+    }
+    const userMsg = { role: 'user', source: { kind: 'user', rpcId: 'x' }, content: nlText }
+    const d = await ctx.emit('agent/pre-step', { signal: {} }, async () => ({ kind: 'enter', messages: [runtime, userMsg] }))
+    check('v2.1 运行时上下文快照原样放行', d.messages[0].content === runtime.content)
+    check('v2.1 快照不触发弹窗(仅用户消息弹一次)', askCount === 1 && /text2img/.test(txt(d.messages[1].content)))
+  }
+}
+
+console.log('== text2img v2.1 摘要磁盘缓存(跨会话 0 API) ==')
+{
+  const cacheDir = mkdtempSync(join(tmpdir(), 't2i-cache-'))
+  const nlText = '缓存测试' + '这是一段用于摘要磁盘缓存测试的自然语言长文本内容。'.repeat(15)
+  const enterWith = (text) => async () => ({ kind: 'enter', messages: [{ content: text }] })
+  const base = { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, askOnSkip: false }
+
+  // 1) 首次转换:渲染+摘要;二次转换:命中缓存,renderer 不再被调用
+  {
+    let renderCalls = 0
+    const deps = {
+      renderToPng: async () => { renderCalls += 1; return '/tmp/fake.png' },
+      summarizeImage: async () => '[摘要] 磁盘缓存测试摘要。',
+    }
+    const ctx = makeFakeCtx()
+    const stats = createStats()
+    createText2imgModule(ctx, { ...base, summaryCache: true }, stats, { ...deps, cacheDir })
+    const d1 = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    const d2 = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    check('v2.1 缓存首次转换渲染 1 次', renderCalls === 1)
+    check('v2.1 缓存二次命中不重渲染', renderCalls === 1 && /text2img/.test(txt(d2.messages[0].content)))
+    check('v2.1 缓存命中计数', stats.snapshot().counters['text2img.cacheHits'] === 1)
+    check('v2.1 缓存命中标记', /摘要命中磁盘缓存/.test(txt(d2.messages[0].content)))
+    check('v2.1 首次转换标记无缓存字样', !/摘要命中磁盘缓存/.test(txt(d1.messages[0].content)))
+  }
+  // 2) 跨"会话"(新模块实例,同一 cacheDir)→ 命中缓存,0 渲染 0 摘要
+  {
+    let renderCalls = 0
+    let summarizeCalls = 0
+    const deps = {
+      renderToPng: async () => { renderCalls += 1; return '/tmp/fake.png' },
+      summarizeImage: async () => { summarizeCalls += 1; return '[摘要] 不应被调用。' },
+    }
+    const ctx = makeFakeCtx()
+    createText2imgModule(ctx, { ...base, summaryCache: true }, createStats(), { ...deps, cacheDir })
+    const d = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    check('v2.1 跨会话命中缓存 0 渲染 0 API', renderCalls === 0 && summarizeCalls === 0)
+    check('v2.1 跨会话复用摘要', /磁盘缓存测试摘要/.test(txt(d.messages[0].content)))
+  }
+  // 3) 不同内容 → 未命中,正常渲染
+  {
+    let renderCalls = 0
+    const deps = {
+      renderToPng: async () => { renderCalls += 1; return '/tmp/fake.png' },
+      summarizeImage: async () => '[摘要] 新内容摘要。',
+    }
+    const ctx = makeFakeCtx()
+    createText2imgModule(ctx, { ...base, summaryCache: true }, createStats(), { ...deps, cacheDir })
+    await ctx.emit('agent/pre-step', { signal: {} }, enterWith('完全不同' + '的另一段自然语言文本内容用于缓存未命中测试。'.repeat(15)))
+    check('v2.1 不同内容未命中正常渲染', renderCalls === 1)
+  }
+  // 4) 原文落盘去重:DSH 每 step 重发同一消息,缓存命中复用首次原文路径(事故:7 次出现 → 7 个重复文件)
+  {
+    const origDir = mkdtempSync(join(tmpdir(), 't2i-orig-'))
+    const textDup = '原文去重' + '这是一段用于原文落盘去重测试的自然语言长文本内容。'.repeat(15)
+    const depsD = {
+      renderToPng: async () => '/tmp/fake.png',
+      summarizeImage: async () => '[摘要] 原文去重测试。',
+    }
+    const ctx = makeFakeCtx()
+    createText2imgModule(ctx, { ...base, summaryCache: true, saveOriginal: true }, createStats(), { ...depsD, cacheDir, originalDir: origDir })
+    const d1 = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(textDup))
+    const d2 = await ctx.emit('agent/pre-step', { signal: {} }, enterWith(textDup))
+    const files = readdirSync(origDir)
+    check('v2.1 缓存命中复用首次原文路径', files.length === 1 && txt(d2.messages[0].content).includes(files[0]) && /原始全文/.test(txt(d1.messages[0].content)))
+  }
+  // 5) 提示词变更 → 缓存作废(坏摘要被缓存复用会把事故永久化:知乎长文事故)
+  {
+    let renderCalls = 0
+    const deps = {
+      renderToPng: async () => { renderCalls += 1; return '/tmp/fake.png' },
+      summarizeImage: async () => '[摘要] 新提示词摘要。',
+    }
+    const ctx = makeFakeCtx()
+    // 同一文本 nlText 在测试 1 里已用默认提示词缓存;换提示词后必须走 vision
+    createText2imgModule(ctx, { ...base, summaryCache: true, prompt: '完全不同的摘要提示词' }, createStats(), { ...deps, cacheDir })
+    await ctx.emit('agent/pre-step', { signal: {} }, enterWith(nlText))
+    check('v2.1 提示词变更缓存作废', renderCalls === 1)
+  }
+}
+
+console.log('== text2img v2.1 动态分辨率分档 ==')
+{
+  const base = { ...resolveConfig({}).text2img, threshold: 100, saveOriginal: false, askOnSkip: false, summaryCache: false }
+  const enterWith = (text) => async () => ({ kind: 'enter', messages: [{ content: text }] })
+  let lastPageConfig = null
+  const deps = {
+    renderToPng: async (text, pageConfig) => { lastPageConfig = pageConfig; return '/tmp/fake.png' },
+    summarizeImage: async () => '[摘要] 分档测试。',
+  }
+  const ctx = makeFakeCtx()
+  createText2imgModule(ctx, base, createStats(), deps)
+  await ctx.emit('agent/pre-step', { signal: {} }, enterWith('好'.repeat(1500)))
+  check('v2.1 ≤2000 字 → 800×450', lastPageConfig.width === 800 && lastPageConfig.pageMaxHeight === 450 && lastPageConfig.pageFontSize === 24)
+  await ctx.emit('agent/pre-step', { signal: {} }, enterWith('好'.repeat(5000)))
+  check('v2.1 ≤6000 字 → 1440×810', lastPageConfig.width === 1440 && lastPageConfig.pageMaxHeight === 810 && lastPageConfig.pageFontSize === 24)
+  await ctx.emit('agent/pre-step', { signal: {} }, enterWith('好'.repeat(8000)))
+  check('v2.1 >6000 字 → 1920×1080@36 号', lastPageConfig.width === 1920 && lastPageConfig.pageMaxHeight === 1080 && lastPageConfig.pageFontSize === 36)
+
+  // dynamicResolution=false → 固定 renderWidth + 分页参数
+  let lastPageConfig2 = null
+  const deps2 = {
+    renderToPng: async (text, pageConfig) => { lastPageConfig2 = pageConfig; return '/tmp/fake.png' },
+    summarizeImage: async () => '[摘要] 分档测试。',
+  }
+  const ctx2 = makeFakeCtx()
+  createText2imgModule(ctx2, { ...base, dynamicResolution: false, renderWidth: 900 }, createStats(), deps2)
+  await ctx2.emit('agent/pre-step', { signal: {} }, enterWith('好'.repeat(8000)))
+  check('v2.1 关闭动态分辨率用 renderWidth', lastPageConfig2.width === 900 && lastPageConfig2.pageMaxHeight === 3000)
 }
 
 console.log('== outputLadder ==')

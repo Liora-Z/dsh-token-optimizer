@@ -10,7 +10,7 @@
 
 | 模块 | 钩子 | 作用 |
 | :--- | :--- | :--- |
-| text2img | `agent/pre-step` | 超长自然语言文本（>5000 字符）→ 渲染成图 → vision 读图 → 摘要替换进上下文。单次样本曾省 ~72%；真正价值是**长会话越省**（后续轮次不再携带原文）。JSON/代码自动跳过 |
+| text2img | `agent/pre-step` | 长文本（≥1000 字符）→ **弹窗询问**（转图摘要 / 直接阅读原文，推荐项与超时默认按内容类型定）→ 渲染成图 → vision 读图 → 摘要替换进上下文。动态分辨率分档（800×450 / 1440×810 / 1920×1080），分批摘要强制全文覆盖，摘要磁盘缓存跨会话 0 API 调用。单次样本曾省 ~72%；真正价值是**长会话越省**（后续轮次不再携带原文） |
 | outputLadder | `tools/post-execute` | 工具输出出生点**单次遍历分流**：错误结果→300 字符摘要；JSON 数组/CSV（≥10k 字符）→结构感知压缩；shell 输出（≥8k 字符）→头尾+等距采样；≥50k 字节交核心 spill；read 类豁免。原文落盘可逆 |
 | fileDiff | `tools/post-execute` | 重复读文件：未变→折叠标记；有变→只发变更区段 diff |
 | toolTrim | `agent/created` | 工具可见性管理：静态裁剪 + **MCP 懒加载**——不用的 `mcp__*` 工具 schema **不进请求**（实测省 ~9.4k token/请求） |
@@ -43,14 +43,26 @@ dsh plugin --profile web remove dsh-token-optimizer
   config:
     text2img:
       enabled: true
-      threshold: 5000
-      pageFontSize: 24
-      pageMaxHeight: 3000
+      threshold: 1000
+      askOnSkip: true        # false = 不弹窗，回退自动行为（自然语言自动转图/结构性强跳过）
+      askTimeoutMs: 120000   # 询问超时，超时按内容类型默认执行
+      maxAsksPerSession: 0   # 每会话弹窗上限（0=不限），嫌弹窗多可设 3~5，超限按内容类型默认静默执行
+      summaryCache: true     # 内容 hash → 摘要磁盘缓存，跨会话命中 0 API（含原文落盘去重）
+      dynamicResolution: true
+      resolutionTiers:       # 按字数分档（尺寸经实测校准：YaHei 行高 ≈1.9×字号，
+                             # 密度保持在已验证安全的 ~1千字/页 以内）
+        - { maxChars: 2000, width: 800, height: 450, fontSize: 24 }
+        - { maxChars: 6000, width: 1440, height: 810, fontSize: 24 }
+        - { maxChars: Infinity, width: 1920, height: 1080, fontSize: 36 }
+      renderWidth: 1200      # dynamicResolution=false 时的固定宽度
+      pageFontSize: 24       # dynamicResolution=false 时用
+      pageMaxHeight: 3000    # dynamicResolution=false 时用
       visionModel: 'deepseek-v4-flash-vision-exp'
       baseUrl: 'https://api.deepseek.com/v1'
       maxSummaryChars: 2000
+      maxSummaryRatio: 0.4   # 摘要上限 = min(maxSummaryChars, 输入字数×0.4)，保证替换后比原文短
+      pagesPerBatch: 4       # 分批摘要：每批最多 4 页送 vision（防"只读开头几页"），再纯文本合并
       saveOriginal: true
-      askOnSkip: true
     outputLadder:
       enabled: true
       structureThreshold: 10000
@@ -90,6 +102,13 @@ dsh plugin --profile web remove dsh-token-optimizer
       maxCompactionsPerSession: 3
       contextWindow: 1000000
       timeoutMs: 120000
+    memory_bridge:            # dsh-memory-bridge 联动占位节（阶段 3b 完成后开开关）
+      enabled: false
+      sync_dir: '~/.dsh-memory'
+      compress_on_sync: true
+      compression_strategy: 'time_decay'
+      text2img_threshold: 1000
+      dynamic_resolution: true
 ```
 
 > v1 的 `compress` / `sample` / `pruning` / `dedup` 节已退役（合并进 outputLadder），旧配置节会被静默忽略并在日志提示，不会导致加载失败。
@@ -118,14 +137,14 @@ web 部署因此**没有 compaction 服务**，`compactionDriver` 会静默不�
 
 | 类别 | 实际行为 | 边界 |
 | :--- | :--- | :--- |
-| 文件 files | 写 `~/.dsh/token-optimizer/` 下的落盘原文（text2img-originals / originals / filediff-originals）、系统临时目录的渲染 PNG；设 `DSH_TOKEN_OPTIMIZER_DEBUG=1` 时写调试日志 | 只写插件自有状态目录与临时产物，**不写 Profile 配置、不改 DSH 核心/官方包**；日志默认关闭 |
+| 文件 files | 写 `~/.dsh/token-optimizer/` 下的落盘原文（text2img-originals / originals / filediff-originals）与摘要磁盘缓存（text2img-summary-cache，含内容 hash→摘要映射）、系统临时目录的渲染 PNG；设 `DSH_TOKEN_OPTIMIZER_DEBUG=1` 时写调试日志 | 只写插件自有状态目录与临时产物，**不写 Profile 配置、不改 DSH 核心/官方包**；日志默认关闭 |
 | 网络 network | text2img 摘要调用 `baseUrl`（默认 `https://api.deepseek.com/v1`）的 `/chat/completions` | 只向该端点发送需摘要的文本与渲染图；请求失败即降级跳过转图，不阻断会话 |
 | 命令 commands | Windows 上用 PowerShell + .NET System.Drawing 渲染文本图片（`scripts/render-text.ps1`） | 只执行插件自带渲染脚本，参数固定；非 Windows 自动降级为仅落盘，不执行任何命令 |
 | 凭据 credentials | 经 DSH 凭据服务 `ctx.credentials.resolve` 读取；不可用时回退 `process.env.DEEPSEEK_API_KEY` | 仅用于 text2img 的 vision 调用，写入请求头后不落盘、不写日志、不外传 |
 
 - **运行时依赖**：零 npm 依赖。text2img 摘要依赖外部服务 DeepSeek API（key 由 DSH 凭据/环境变量提供）；Windows 渲染依赖 PowerShell + .NET System.Drawing（系统自带）。
 - **失败边界**：所有模块 fail-open——任一步出错只降级跳过（保留原文），不影响 DSH 核心流程；模块间无共享可变状态，卸载时统一清理钩子。
-- **已知风险**：text2img 摘要可能不准确（摘要自带警告标记，原文落盘可查）；outputLadder/fileDiff 压缩丢细节（原文落盘可回放）；compactionDriver 触发压缩后旧历史按 DSH 核心语义进入可回放区；toolTrim 的 `allow` 为排他白名单，误配会让工具对模型不可见（默认关闭）。
+- **已知风险**：text2img 摘要可能不准确（摘要自带警告标记，原文落盘可查；页数多时按 `pagesPerBatch` 分批摘要并合并，每次转图会产生多次 Flash vision 调用）；outputLadder/fileDiff 压缩丢细节（原文落盘可回放）；compactionDriver 触发压缩后旧历史按 DSH 核心语义进入可回放区；toolTrim 的 `allow` 为排他白名单，误配会让工具对模型不可见（默认关闭）。
 - **兼容范围**：完整开发与验证基于 DSH `0.1.1-rc.2`（Node ≥ 18）；`0.1.2+` 与 `0.1.3+` 尚未验证，在 `package.json` 的 `dsh.compatibility.dshReleases` 中标为 `unknown`。
 
 
@@ -142,6 +161,7 @@ node test/text2img-e2e.mjs   # 真实端到端（需 API key + Windows 渲染）
 - 自然语言配置工具（让模型改配置）
 - 长文本→图片的跨平台渲染 fallback
 - 与 [dsh-behavior-enhancer](https://github.com/Zoria-Lind/dsh-behavior-enhancer) 协同（内容压缩 × 行为管理，可独立安装）
+- dsh-memory-bridge 联动（配置节已占位，扩展 + bridge 服务就绪后开开关）
 
 ## 许可 / License
 
