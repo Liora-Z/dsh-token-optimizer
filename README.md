@@ -6,7 +6,7 @@
 基于真实 DSH 插件 API（`agent/pre-step`、`tools/execute`、`tools/post-execute`、`agent/status` 等）实现，
 与社区方案文档中虚构的事件(如 `message:before` / `context:building`)无关。
 
-## 它做什么（30 秒版）
+## 它做什么（30秒知）
 
 | 模块 | 钩子 | 作用 |
 | :--- | :--- | :--- |
